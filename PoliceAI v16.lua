@@ -1,7 +1,8 @@
--- Police AI v16 (client-sided, self-building)
--- Officer drives the police car (4128343988) ON ROADS, chases other players (never you),
+-- Police AI v17 (client-sided, self-building)
+-- Officer drives the police car (13573040423) ON ROADS, chases other players (never you),
 -- carries a pistol (5268138684) and an MP9 (117326611764505) with ammo, reloads and sounds.
 -- v16: SWAT car front flipped, helicopter fires heat-seeking missiles.
+-- v17: new police car rig with suspension + rotating/steering wheels, wail/yelp sirens.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
@@ -13,8 +14,19 @@ local playerRoot = playerChar:WaitForChild("HumanoidRootPart")
 ----------------------------------------------------------------
 -- CONFIG
 ----------------------------------------------------------------
-local CAR_ID = 4128343988
-local CAR_REVERSE_FRONT = false -- true if the car drives backwards
+local CAR_ID = 13573040423
+local SIREN_WAIL_ID = 89059022469518
+local SIREN_YELP_ID = 110601329618001
+local SIREN_WAIL_TIME = 7 -- seconds of wail before switching to yelp
+local SIREN_YELP_TIME = 4
+local SUSP_TRAVEL = 0.9 -- how far each wheel can move up/down (studs)
+local SUSP_DAMP = 12 -- higher = less bouncy
+local MAX_STEER_ANGLE = 0.45 -- front wheel turn (radians)
+local LEAN_CORNER = 0.06 -- body roll in corners
+local WHEEL_RIDE = 0.55 -- wheel centre height above the body bottom, in wheel radii (raise if the car sits too low)
+local WHEEL_Y_ADJUST = 0 -- extra studs to move snapped wheels up (+) or down (-)
+local CAR_UPSIDE_DOWN = nil -- nil = auto-detect; set true/false to force the rig upright if it still comes out flipped
+local CAR_REVERSE_FRONT = true -- true if the police car drives backwards (applies to the police car only, not the SWAT car)
 local MAX_SPEED = 90
 local ACCEL = 70
 local TURN_RATE = 2.4
@@ -308,6 +320,7 @@ end
 
 ----------------------------------------------------------------
 -- police car: one rigid body driven with forces
+-- v17: wheels (car.Wheels.FL/FR/RL/RR) get raycast suspension, steering and spin
 ----------------------------------------------------------------
 local function spawnCar(cf, carId, flipFront)
 	local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. (carId or CAR_ID)) end)
@@ -331,9 +344,119 @@ local function spawnCar(cf, carId, flipFront)
 			d:Destroy()
 		end
 	end
+
+	-- find the wheels: parts/models named FL FR RL RR (inside "Wheels" if it exists), else anything named wheel/tire
+	local wheelSet, wheelDefs = {}, {}
+	local searchRoot = car
+	for _, inst in ipairs(car:GetDescendants()) do
+		if inst.Name:lower() == "wheels" and (inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("BasePart")) then
+			searchRoot = inst
+			break
+		end
+	end
+	local cands, candSet = {}, {}
+	for _, n in ipairs({"FL", "FR", "RL", "RR"}) do
+		for _, inst in ipairs(searchRoot:GetDescendants()) do
+			if (inst:IsA("BasePart") or inst:IsA("Model")) and inst.Name:upper() == n then
+				table.insert(cands, inst)
+				candSet[inst] = true
+				break
+			end
+		end
+	end
+	if #cands < 4 then
+		cands, candSet = {}, {}
+		for _, inst in ipairs(car:GetDescendants()) do
+			local nm = inst.Name:lower()
+			if (inst:IsA("BasePart") or inst:IsA("Model")) and (nm:find("wheel") or nm:find("tire") or nm:find("tyre"))
+				and nm ~= "wheels" and not candSet[inst.Parent] then
+				table.insert(cands, inst)
+				candSet[inst] = true
+			end
+		end
+	end
+	for _, w in ipairs(cands) do
+		local parts = {}
+		if w:IsA("BasePart") then table.insert(parts, w) end
+		for _, dd in ipairs(w:GetDescendants()) do
+			if dd:IsA("BasePart") then table.insert(parts, dd) end
+		end
+		local hub, hv = nil, 0
+		for _, p in ipairs(parts) do
+			local v = p.Size.X * p.Size.Y * p.Size.Z
+			if v > hv then hub, hv = p, v end
+		end
+		if hub then
+			for _, p in ipairs(parts) do wheelSet[p] = true end
+			table.insert(wheelDefs, {hub = hub, parts = parts, cs = SUSP_TRAVEL, yaw = 0, spin = 0})
+		end
+	end
+	warn("[PoliceCar] wheels found: " .. #wheelDefs)
+	if #wheelDefs == 0 then
+		warn("[PoliceCar] no wheels detected. Car contents:")
+		for _, inst in ipairs(car:GetDescendants()) do
+			if inst:IsA("BasePart") or inst:IsA("Model") or inst:IsA("Folder") then
+				warn("  " .. inst:GetFullName() .. " (" .. inst.ClassName .. ")")
+			end
+		end
+	end
+
+	-- bounding box of the car body (no wheels) in a given frame
+	local function bounds(frame)
+		local mn = Vector3.new(math.huge, math.huge, math.huge)
+		local mx = Vector3.new(-math.huge, -math.huge, -math.huge)
+		for _, p in ipairs(car:GetDescendants()) do
+			if p:IsA("BasePart") and not wheelSet[p] then
+				local rel = frame:ToObjectSpace(p.CFrame)
+				local hs = p.Size / 2
+				for sx = -1, 1, 2 do
+					for sy = -1, 1, 2 do
+						for sz = -1, 1, 2 do
+							local c = rel:PointToWorldSpace(Vector3.new(hs.X * sx, hs.Y * sy, hs.Z * sz))
+							mn = Vector3.new(math.min(mn.X, c.X), math.min(mn.Y, c.Y), math.min(mn.Z, c.Z))
+							mx = Vector3.new(math.max(mx.X, c.X), math.max(mx.Y, c.Y), math.max(mx.Z, c.Z))
+						end
+					end
+				end
+			end
+		end
+		return mn, mx
+	end
+
+	-- P = the car's upright frame (model pivot; flipped 180 if the rig was built upside down)
+	local P = car:GetPivot()
+	local mn, mx = bounds(P)
+	if mn.X == math.huge then
+		warn("[PoliceCar] no body parts found")
+		car:Destroy()
+		return nil
+	end
+	local flip = CAR_UPSIDE_DOWN
+	if flip == nil and #wheelDefs > 0 then
+		local cs = Vector3.zero
+		for _, w in ipairs(wheelDefs) do cs += P:PointToObjectSpace(w.hub.Position) end
+		cs /= #wheelDefs
+		local bc, bs = (mn + mx) / 2, mx - mn
+		local hz = Vector3.new(cs.X - bc.X, 0, cs.Z - bc.Z).Magnitude
+		flip = hz < 0.3 * math.max(bs.X, bs.Z) and cs.Y > bc.Y + 0.1 * bs.Y
+		if flip then warn("[PoliceCar] rig is upside down in the model, flipping it upright") end
+	end
+	if flip then
+		P = P * CFrame.Angles(0, 0, math.pi)
+		mn, mx = bounds(P)
+	end
+	local bodyC, bodySz = (mn + mx) / 2, mx - mn
+
+	-- cut the rig's own joints to the wheels (we drive them ourselves)
+	for _, dd in ipairs(car:GetDescendants()) do
+		if (dd:IsA("JointInstance") or dd:IsA("WeldConstraint")) and (wheelSet[dd.Part0] or wheelSet[dd.Part1]) then
+			dd:Destroy()
+		end
+	end
+
 	local base, bestV = nil, 0
 	for _, p in ipairs(car:GetDescendants()) do
-		if p:IsA("BasePart") then
+		if p:IsA("BasePart") and not wheelSet[p] then
 			local v = p.Size.X * p.Size.Y * p.Size.Z
 			if v > bestV then base, bestV = p, v end
 		end
@@ -344,16 +467,58 @@ local function spawnCar(cf, carId, flipFront)
 		if p:IsA("BasePart") then
 			p.Anchored = false
 			p.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.02, 0, 1, 1)
-			if p ~= base then weld(base, p) end
+			if wheelSet[p] then
+				p.Massless = true
+				p.CanCollide = false
+			elseif p ~= base then
+				weld(base, p)
+			end
 		end
 	end
 
-	local bcf, bsize = car:GetBoundingBox()
+	-- the rig may ship its wheels away from the body: snap them under the car (keeps their track + wheelbase)
+	if #wheelDefs > 0 then
+		local cSum, rSum = Vector3.zero, 0
+		for _, w in ipairs(wheelDefs) do
+			cSum += P:PointToObjectSpace(w.hub.Position)
+			local s = {w.hub.Size.X, w.hub.Size.Y, w.hub.Size.Z}
+			table.sort(s)
+			rSum += s[3] / 2
+		end
+		local cC, avgR = cSum / #wheelDefs, rSum / #wheelDefs
+		local horiz = Vector3.new(cC.X - bodyC.X, 0, cC.Z - bodyC.Z).Magnitude
+		local far = horiz > 0.3 * math.max(bodySz.X, bodySz.Z) or cC.Y > mx.Y or cC.Y < mn.Y - bodySz.Y
+		warn(string.format("[PoliceCar] wheel cluster offset %.1f studs from body, snapping: %s", horiz, tostring(far)))
+		if far then
+			local target = Vector3.new(bodyC.X, mn.Y + avgR * WHEEL_RIDE + WHEEL_Y_ADJUST, bodyC.Z)
+			local delta = P:VectorToWorldSpace(target - cC)
+			for _, w in ipairs(wheelDefs) do
+				for _, p in ipairs(w.parts) do p.CFrame = p.CFrame + delta end
+			end
+		end
+	end
+	for _, w in ipairs(wheelDefs) do
+		for _, p in ipairs(w.parts) do
+			if p ~= w.hub then weld(w.hub, p) end
+		end
+		local s = {w.hub.Size.X, w.hub.Size.Y, w.hub.Size.Z}
+		table.sort(s)
+		w.radius = s[3] / 2
+		w.rest = base.CFrame:ToObjectSpace(w.hub.CFrame)
+		w.joint = mk("Weld", {Part0 = base, Part1 = w.hub, C0 = w.rest}, base)
+	end
+
+	-- light bar on the roof (in the upright frame, so it works whatever way the base part is rotated)
+	local longZ = bodySz.Z >= bodySz.X
+	local length = longZ and bodySz.Z or bodySz.X
+	local width = longZ and bodySz.X or bodySz.Z
 	local bar = {}
 	for i, c in ipairs({Color3.fromRGB(255, 0, 0), Color3.fromRGB(0, 80, 255)}) do
-		local p = mk("Part", {Name = "Light" .. i, Size = Vector3.new(bsize.X * 0.35, 0.4, 0.8), Color = c,
-			Material = Enum.Material.Neon, CanCollide = false, Massless = true}, car)
-		p.CFrame = bcf * CFrame.new((i == 1 and -1 or 1) * bsize.X * 0.18, bsize.Y / 2 + 0.2, 0)
+		local off = (i == 1 and -1 or 1) * width * 0.18
+		local p = mk("Part", {Name = "Light" .. i,
+			Size = longZ and Vector3.new(width * 0.35, 0.4, 0.8) or Vector3.new(0.8, 0.4, width * 0.35),
+			Color = c, Material = Enum.Material.Neon, CanCollide = false, Massless = true}, car)
+		p.CFrame = P * CFrame.new(bodyC.X + (longZ and off or 0), mx.Y + 0.2, bodyC.Z + (longZ and 0 or off))
 		weld(base, p)
 		mk("PointLight", {Color = c, Range = 18, Brightness = 3}, p)
 		bar[i] = p
@@ -368,14 +533,17 @@ local function spawnCar(cf, carId, flipFront)
 		end
 	end)
 
-	local lenLocal = base.Size.Z >= base.Size.X and Vector3.new(0, 0, -1) or Vector3.new(1, 0, 0)
-	local rev = CAR_REVERSE_FRONT
+	-- axes expressed in the base part's local space (the base part may be rotated inside the model)
+	local frame = base.CFrame:ToObjectSpace(P)
+	local R = frame - frame.Position
+	local lenLocal = R:VectorToWorldSpace(longZ and Vector3.new(0, 0, -1) or Vector3.new(1, 0, 0))
+	local upLocal = R:VectorToWorldSpace(Vector3.yAxis)
+	local rev = (carId == nil or carId == CAR_ID) and CAR_REVERSE_FRONT or false
 	if flipFront then rev = not rev end
 	if rev then lenLocal = -lenLocal end
-	local frontCF = CFrame.lookAt(Vector3.zero, lenLocal)
-	local left = Vector3.yAxis:Cross(lenLocal)
-	local length = (lenLocal.X ~= 0) and base.Size.X or base.Size.Z
-	local width = (lenLocal.X ~= 0) and base.Size.Z or base.Size.X
+	local frontCF = CFrame.lookAt(Vector3.zero, lenLocal, upLocal)
+	local left = upLocal:Cross(lenLocal)
+	local height = bodySz.Y
 
 	local eng = mk("Sound", {Name = "Engine", SoundId = "rbxassetid://" .. ENGINE_SOUND_ID, Looped = true,
 		Volume = 0.4, RollOffMinDistance = 15, RollOffMaxDistance = 220}, base)
@@ -397,10 +565,86 @@ local function spawnCar(cf, carId, flipFront)
 	function d.fwd() return flat(base.CFrame:VectorToWorldSpace(lenLocal)) end
 	function d.speed() return base.AssemblyLinearVelocity:Dot(d.fwd()) end
 	function d.driverCF()
-		return base.CFrame * CFrame.new(left * (width * 0.2) + lenLocal * (length * 0.1) + Vector3.new(0, DRIVER_UP, 0)) * frontCF
+		return base.CFrame * CFrame.new(left * (width * 0.2) + lenLocal * (length * 0.1) + upLocal * DRIVER_UP) * frontCF
 	end
 	function d.exitPos()
-		return base.CFrame:PointToWorldSpace(left * (width / 2 + 3) + Vector3.new(0, base.Size.Y / 2 + 3, 0))
+		return base.CFrame:PointToWorldSpace(left * (width / 2 + 3) + upLocal * (height / 2 + 3))
+	end
+
+	-- sirens: wail <-> yelp while chasing
+	local wail = mk("Sound", {Name = "Wail", SoundId = "rbxassetid://" .. SIREN_WAIL_ID, Looped = true,
+		Volume = 0.8, RollOffMinDistance = 25, RollOffMaxDistance = 350}, base)
+	local yelp = mk("Sound", {Name = "Yelp", SoundId = "rbxassetid://" .. SIREN_YELP_ID, Looped = true,
+		Volume = 0.8, RollOffMinDistance = 25, RollOffMaxDistance = 350}, base)
+	d.sirenOn = false
+	function d.setSiren(on) d.sirenOn = on end
+	task.spawn(function()
+		local useYelp = false
+		while car.Parent do
+			if d.sirenOn then
+				local s, o = wail, yelp
+				if useYelp then s, o = yelp, wail end
+				o:Stop()
+				if not s.IsPlaying then s:Play() end
+				local t0, dur = tick(), useYelp and SIREN_YELP_TIME or SIREN_WAIL_TIME
+				while car.Parent and d.sirenOn and tick() - t0 < dur do task.wait(0.1) end
+				useYelp = not useYelp
+			else
+				wail:Stop()
+				yelp:Stop()
+				task.wait(0.2)
+			end
+		end
+	end)
+
+	-- suspension: a spring per wheel (raycast), wheels follow the ground, steer and roll
+	local leanP, leanR = 0, 0
+	local function stepWheels(dt, fSpeed, vel, up)
+		local n = #wheelDefs
+		if n == 0 then return Vector3.zero end
+		local cfB = base.CFrame
+		local bUp = cfB:VectorToWorldSpace(upLocal)
+		local mass = base.AssemblyMass
+		local vUp = vel:Dot(up)
+		local total = Vector3.zero
+		local sideSum, foreSum = 0, 0
+		for _, w in ipairs(wheelDefs) do
+			local rp = w.rest.Position
+			local origin = cfB:PointToWorldSpace(rp) + bUp * SUSP_TRAVEL
+			local rayLen = w.radius + 2 * SUSP_TRAVEL
+			local hit = workspace:Raycast(origin, -bUp * rayLen, groundParams)
+			local c = 0
+			if hit and hit.Instance.CanCollide then
+				local mdl = hit.Instance:FindFirstAncestorOfClass("Model")
+				if not (mdl and mdl:FindFirstChildOfClass("Humanoid")) then
+					c = math.clamp(rayLen - hit.Distance, 0, 2 * SUSP_TRAVEL)
+				end
+			end
+			if c > 0 then
+				local fMag = (mass * workspace.Gravity / n) * (c / SUSP_TRAVEL) - (SUSP_DAMP * mass / n) * vUp
+				total += up * math.max(fMag, 0)
+			end
+			w.cs += (c - w.cs) * math.min(1, dt * 20)
+			local isFront = rp:Dot(lenLocal) > 0
+			local side = rp:Dot(left) > 0 and 1 or -1
+			sideSum += w.cs * side
+			foreSum += w.cs * (isFront and 1 or -1)
+			local steerAng = isFront and (d.steer * MAX_STEER_ANGLE) or 0
+			w.yaw += (steerAng - w.yaw) * math.min(1, dt * 10)
+			w.spin = (w.spin + fSpeed / w.radius * dt) % (math.pi * 2)
+			w.joint.C0 = CFrame.new(rp + upLocal * (w.cs - SUSP_TRAVEL))
+				* CFrame.fromAxisAngle(upLocal, w.yaw)
+				* CFrame.fromAxisAngle(left, w.spin)
+				* (w.rest - w.rest.Position)
+		end
+		-- body leans with the springs, in corners, and under throttle / braking
+		local tRoll = -(sideSum / math.max(n / 2, 1) / width) * 0.5
+			- d.steer * math.clamp(fSpeed / MAX_SPEED, -1, 1) * LEAN_CORNER
+		local tPitch = (foreSum / math.max(n / 2, 1) / (length * 0.6)) * 0.5
+			+ d.throttle * 0.015 - ((d.brake and fSpeed > 5) and 0.04 or 0)
+		leanR += (math.clamp(tRoll, -0.15, 0.15) - leanR) * math.min(1, dt * 6)
+		leanP += (math.clamp(tPitch, -0.15, 0.15) - leanP) * math.min(1, dt * 6)
+		return total
 	end
 
 	local conn
@@ -411,7 +655,7 @@ local function spawnCar(cf, carId, flipFront)
 		local fwd = d.fwd()
 
 		-- ground probe: centre + 4 corners -> slope normal and grounded flag
-		local reach = base.Size.Y / 2 + 6
+		local reach = height / 2 + 6
 		local leftW = flat(cfB:VectorToWorldSpace(left))
 		local offs = {Vector3.zero, fwd * length * 0.4, -fwd * length * 0.4, leftW * width * 0.4, -leftW * width * 0.4}
 		local nSum, cnt = Vector3.zero, 0
@@ -434,6 +678,11 @@ local function spawnCar(cf, carId, flipFront)
 		local fwdT = fwd - up * fwd:Dot(up)
 		fwdT = fwdT.Magnitude > 0.01 and fwdT.Unit or fwd
 		local fSpeed = vel:Dot(fwdT)
+		local okW, suspF = pcall(stepWheels, dt, fSpeed, vel, up)
+		if not okW then
+			if not d.warned then d.warned = true warn("[PoliceCar] wheel error: " .. tostring(suspF)) end
+			suspF = Vector3.zero
+		end
 
 		-- steering (physics-style: needs speed), then tilt the car to follow the ground
 		local sf = math.clamp(fSpeed / 15, -1, 1)
@@ -441,7 +690,7 @@ local function spawnCar(cf, carId, flipFront)
 		if heading:Dot(fwd) < 0.5 then heading = fwd end
 		local hT = heading - up * heading:Dot(up)
 		hT = hT.Magnitude > 0.01 and hT.Unit or fwdT
-		al.CFrame = CFrame.lookAt(Vector3.zero, hT, up) * frontCF:Inverse()
+		al.CFrame = CFrame.lookAt(Vector3.zero, hT, up) * CFrame.Angles(leanP, 0, leanR) * frontCF:Inverse()
 
 		-- thrust along the slope + cancel the downhill pull of gravity so the car can climb and hold
 		local mass = base.AssemblyMass
@@ -456,7 +705,7 @@ local function spawnCar(cf, carId, flipFront)
 			local gF = Vector3.new(0, -workspace.Gravity * mass, 0)
 			f -= (gF - up * gF:Dot(up)) * 0.95
 		end
-		vf.Force = f
+		vf.Force = f + suspF
 
 		-- tire grip (only on the ground): kill sideways slide, add drag / brakes
 		local newV = vel
@@ -1935,7 +2184,10 @@ function runOfficer(cf, name, opts)
 
 	hum.Died:Connect(function()
 		alive = false
-		if drv then drv.throttle, drv.steer, drv.brake = 0, 0, true end
+		if drv then
+			drv.throttle, drv.steer, drv.brake = 0, 0, true
+			drv.setSiren(false)
+		end
 		task.delay(5, function() m:Destroy() end)
 		activeOfficers = math.max(0, activeOfficers - 1)
 		if opts and opts.swat then activeSwat = math.max(0, activeSwat - 1) end
@@ -1953,6 +2205,7 @@ function runOfficer(cf, name, opts)
 		enterCar()
 		while alive and hum.Health > 0 and m.Parent do
 			target = findGlobalTarget(root.Position)
+			if drv then drv.setSiren(target ~= nil) end
 			if target then
 				chaseStart = chaseStart or tick()
 				if tick() - chaseStart > HELI_DELAY then callHelicopter(target.Position) end
@@ -2338,4 +2591,4 @@ player.CharacterAdded:Connect(function()
 end)
 givePlayerWeapons()
 
-print("Police AI v16 loaded")
+print("Police AI v17 loaded")
